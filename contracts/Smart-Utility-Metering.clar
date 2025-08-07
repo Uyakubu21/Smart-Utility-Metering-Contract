@@ -5,6 +5,15 @@
 (define-constant ERR-INSUFFICIENT-FUNDS (err u104))
 (define-constant ERR-INVALID-READING (err u105))
 
+(define-constant TIER-LOW-THRESHOLD u1000)
+(define-constant TIER-MEDIUM-THRESHOLD u3000)
+(define-constant TIER-HIGH-THRESHOLD u6000)
+
+(define-constant TIER-LOW-MULTIPLIER u80)
+(define-constant TIER-MEDIUM-MULTIPLIER u100)
+(define-constant TIER-HIGH-MULTIPLIER u125)
+(define-constant TIER-EXCESSIVE-MULTIPLIER u150)
+
 (define-data-var contract-owner principal tx-sender)
 (define-data-var water-rate uint u50)
 (define-data-var electricity-rate uint u75)
@@ -218,6 +227,85 @@
                 (ok (get balance user-data))
             )
             ERR-NOT-FOUND
+        )
+    )
+)
+
+
+(define-map consumption-analytics principal {
+    monthly-water-avg: uint,
+    monthly-electricity-avg: uint,
+    efficiency-score: uint,
+    billing-cycles: uint,
+    last-analytics-update: uint
+})
+
+(define-map tier-statistics (string-ascii 20) {
+    tier-users: uint,
+    total-consumption: uint,
+    revenue-generated: uint
+})
+
+(define-read-only (get-consumption-tier (monthly-usage uint))
+    (if (<= monthly-usage TIER-LOW-THRESHOLD)
+        "low"
+        (if (<= monthly-usage TIER-MEDIUM-THRESHOLD)
+            "medium"
+            (if (<= monthly-usage TIER-HIGH-THRESHOLD)
+                "high"
+                "excessive"
+            )
+        )
+    )
+)
+
+(define-read-only (get-tier-multiplier (tier (string-ascii 20)))
+    (if (is-eq tier "low") TIER-LOW-MULTIPLIER
+        (if (is-eq tier "medium") TIER-MEDIUM-MULTIPLIER
+            (if (is-eq tier "high") TIER-HIGH-MULTIPLIER
+                TIER-EXCESSIVE-MULTIPLIER
+            )
+        )
+    )
+)
+
+(define-read-only (calculate-tiered-bill (usage uint) (base-rate uint))
+    (let ((tier (get-consumption-tier usage))
+          (multiplier (get-tier-multiplier tier)))
+        (/ (* usage base-rate multiplier) u100)
+    )
+)
+
+(define-read-only (get-user-analytics (user principal))
+    (map-get? consumption-analytics user)
+)
+
+(define-read-only (get-tier-stats (tier (string-ascii 20)))
+    (map-get? tier-statistics tier)
+)
+
+(define-public (update-consumption-analytics (user principal) (water-usage uint) (electricity-usage uint))
+    (begin
+        (asserts! (is-oracle tx-sender) ERR-UNAUTHORIZED)
+        (let ((current-analytics (default-to {
+                monthly-water-avg: u0,
+                monthly-electricity-avg: u0,
+                efficiency-score: u100,
+                billing-cycles: u0,
+                last-analytics-update: u0
+            } (map-get? consumption-analytics user)))
+            (cycles (+ (get billing-cycles current-analytics) u1))
+            (new-water-avg (/ (+ (* (get monthly-water-avg current-analytics) (get billing-cycles current-analytics)) water-usage) cycles))
+            (new-electricity-avg (/ (+ (* (get monthly-electricity-avg current-analytics) (get billing-cycles current-analytics)) electricity-usage) cycles))
+            (efficiency (if (and (< new-water-avg TIER-MEDIUM-THRESHOLD) (< new-electricity-avg TIER-MEDIUM-THRESHOLD)) u120 u80)))
+            (map-set consumption-analytics user {
+                monthly-water-avg: new-water-avg,
+                monthly-electricity-avg: new-electricity-avg,
+                efficiency-score: efficiency,
+                billing-cycles: cycles,
+                last-analytics-update: stacks-block-height
+            })
+            (ok true)
         )
     )
 )
