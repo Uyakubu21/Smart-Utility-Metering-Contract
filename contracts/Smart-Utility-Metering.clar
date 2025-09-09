@@ -14,6 +14,14 @@
 (define-constant TIER-HIGH-MULTIPLIER u125)
 (define-constant TIER-EXCESSIVE-MULTIPLIER u150)
 
+(define-constant ERR-NO-POINTS (err u110))
+(define-constant ERR-EXPIRED-POINTS (err u111))
+
+(define-constant PUNCTUAL-PAYMENT-POINTS u100)
+(define-constant EFFICIENT-USAGE-POINTS u50)
+(define-constant LOYALTY-TENURE-BONUS u25)
+(define-constant POINTS-EXPIRY-BLOCKS u4320)
+
 (define-data-var contract-owner principal tx-sender)
 (define-data-var water-rate uint u50)
 (define-data-var electricity-rate uint u75)
@@ -308,4 +316,115 @@
             (ok true)
         )
     )
+)
+
+
+(define-map loyalty-points principal {
+    total-points: uint,
+    points-earned-block: uint,
+    consecutive-punctual-payments: uint,
+    lifetime-points-earned: uint,
+    last-redemption-block: uint
+})
+
+(define-map point-transactions {
+    user: principal,
+    transaction-id: uint
+} {
+    points-used: uint,
+    discount-applied: uint,
+    transaction-block: uint,
+    transaction-type: (string-ascii 20)
+})
+
+(define-data-var transaction-nonce uint u0)
+
+(define-read-only (get-user-loyalty-points (user principal))
+    (map-get? loyalty-points user)
+)
+
+(define-read-only (calculate-available-points (user principal))
+    (match (map-get? loyalty-points user)
+        points-data (let (
+            (blocks-passed (- stacks-block-height (get points-earned-block points-data)))
+        )
+        (if (>= blocks-passed POINTS-EXPIRY-BLOCKS)
+            u0
+            (get total-points points-data)
+        ))
+        u0
+    )
+)
+
+(define-read-only (calculate-discount-percentage (points-to-use uint))
+    (if (>= points-to-use u500)
+        u15
+        (if (>= points-to-use u300)
+            u10
+            (if (>= points-to-use u150)
+                u5
+                u0
+            )
+        )
+    )
+)
+
+(define-public (award-punctual-payment-points (user principal))
+    (begin
+        (asserts! (is-oracle tx-sender) ERR-UNAUTHORIZED)
+        (let (
+            (current-points (default-to {
+                total-points: u0,
+                points-earned-block: stacks-block-height,
+                consecutive-punctual-payments: u0,
+                lifetime-points-earned: u0,
+                last-redemption-block: u0
+            } (map-get? loyalty-points user)))
+            (consecutive-count (+ (get consecutive-punctual-payments current-points) u1))
+            (bonus-multiplier (if (>= consecutive-count u5) u2 u1))
+            (points-to-award (* PUNCTUAL-PAYMENT-POINTS bonus-multiplier))
+            (tenure-bonus (if (>= consecutive-count u10) LOYALTY-TENURE-BONUS u0))
+        )
+        (map-set loyalty-points user {
+            total-points: (+ (get total-points current-points) points-to-award tenure-bonus),
+            points-earned-block: stacks-block-height,
+            consecutive-punctual-payments: consecutive-count,
+            lifetime-points-earned: (+ (get lifetime-points-earned current-points) points-to-award tenure-bonus),
+            last-redemption-block: (get last-redemption-block current-points)
+        })
+        (ok points-to-award)
+        )
+    )
+)
+
+(define-public (redeem-points-for-discount (points-to-use uint))
+    (let (
+        (available-points (calculate-available-points tx-sender))
+        (discount-percentage (calculate-discount-percentage points-to-use))
+        (current-nonce (var-get transaction-nonce))
+    )
+    (begin
+        (asserts! (>= available-points points-to-use) ERR-NO-POINTS)
+        (asserts! (> discount-percentage u0) ERR-INVALID-AMOUNT)
+        (match (map-get? loyalty-points tx-sender)
+            points-data (begin
+                (map-set loyalty-points tx-sender (merge points-data {
+                    total-points: (- (get total-points points-data) points-to-use),
+                    last-redemption-block: stacks-block-height
+                }))
+                (map-set point-transactions {
+                    user: tx-sender,
+                    transaction-id: current-nonce
+                } {
+                    points-used: points-to-use,
+                    discount-applied: discount-percentage,
+                    transaction-block: stacks-block-height,
+                    transaction-type: "discount-redemption"
+                })
+                (var-set transaction-nonce (+ current-nonce u1))
+                (ok discount-percentage)
+            )
+            ERR-NOT-FOUND
+        )
+    ))
 )
