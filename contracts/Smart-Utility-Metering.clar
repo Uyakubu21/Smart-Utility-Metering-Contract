@@ -22,6 +22,14 @@
 (define-constant LOYALTY-TENURE-BONUS u25)
 (define-constant POINTS-EXPIRY-BLOCKS u4320)
 
+(define-constant ERR-ALERT-EXISTS (err u112))
+(define-constant ERR-NO-ALERT (err u113))
+
+(define-constant ANOMALY-THRESHOLD-SPIKE u250)
+(define-constant ANOMALY-THRESHOLD-DROP u80)
+(define-constant CRITICAL-MULTIPLIER u300)
+(define-constant MODERATE-MULTIPLIER u200)
+
 (define-data-var contract-owner principal tx-sender)
 (define-data-var water-rate uint u50)
 (define-data-var electricity-rate uint u75)
@@ -427,4 +435,117 @@
             ERR-NOT-FOUND
         )
     ))
+)
+
+
+(define-map anomaly-alerts {
+    user: principal,
+    alert-id: uint
+} {
+    utility-type: (string-ascii 20),
+    expected-usage: uint,
+    actual-usage: uint,
+    deviation-percentage: uint,
+    severity: (string-ascii 20),
+    alert-block: uint,
+    resolved: bool,
+    resolution-notes: (string-ascii 100)
+})
+
+(define-map user-alert-count principal uint)
+
+(define-map anomaly-config (string-ascii 20) {
+    spike-threshold: uint,
+    drop-threshold: uint,
+    auto-freeze: bool,
+    detection-enabled: bool
+})
+
+(define-data-var alert-nonce uint u0)
+
+(define-read-only (get-anomaly-alert (user principal) (alert-id uint))
+    (map-get? anomaly-alerts {user: user, alert-id: alert-id})
+)
+
+(define-read-only (get-user-alert-count (user principal))
+    (default-to u0 (map-get? user-alert-count user))
+)
+
+(define-read-only (calculate-deviation-percentage (expected uint) (actual uint))
+    (if (> actual expected)
+        (/ (* (- actual expected) u100) expected)
+        (/ (* (- expected actual) u100) expected)
+    )
+)
+
+(define-read-only (determine-severity (deviation uint) (is-spike bool))
+    (if is-spike
+        (if (>= deviation CRITICAL-MULTIPLIER)
+            "critical"
+            (if (>= deviation MODERATE-MULTIPLIER)
+                "moderate"
+                "low"
+            )
+        )
+        "low"
+    )
+)
+
+(define-public (configure-anomaly-detection (utility-type (string-ascii 20)) (spike uint) (drop uint) (auto-freeze bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
+        (map-set anomaly-config utility-type {
+            spike-threshold: spike,
+            drop-threshold: drop,
+            auto-freeze: auto-freeze,
+            detection-enabled: true
+        })
+        (ok true)
+    )
+)
+
+(define-public (detect-and-log-anomaly (user principal) (utility-type (string-ascii 20)) (expected-usage uint) (actual-usage uint))
+    (begin
+        (asserts! (is-oracle tx-sender) ERR-UNAUTHORIZED)
+        (let (
+            (deviation (calculate-deviation-percentage expected-usage actual-usage))
+            (is-spike (> actual-usage expected-usage))
+            (threshold (if is-spike ANOMALY-THRESHOLD-SPIKE ANOMALY-THRESHOLD-DROP))
+            (current-nonce (var-get alert-nonce))
+            (current-count (get-user-alert-count user))
+        )
+        (if (>= deviation threshold)
+            (begin
+                (map-set anomaly-alerts {user: user, alert-id: current-nonce} {
+                    utility-type: utility-type,
+                    expected-usage: expected-usage,
+                    actual-usage: actual-usage,
+                    deviation-percentage: deviation,
+                    severity: (determine-severity deviation is-spike),
+                    alert-block: stacks-block-height,
+                    resolved: false,
+                    resolution-notes: ""
+                })
+                (map-set user-alert-count user (+ current-count u1))
+                (var-set alert-nonce (+ current-nonce u1))
+                (ok current-nonce)
+            )
+            (ok u0)
+        ))
+    )
+)
+
+(define-public (resolve-anomaly-alert (user principal) (alert-id uint) (notes (string-ascii 100)))
+    (begin
+        (asserts! (is-oracle tx-sender) ERR-UNAUTHORIZED)
+        (match (map-get? anomaly-alerts {user: user, alert-id: alert-id})
+            alert (begin
+                (map-set anomaly-alerts {user: user, alert-id: alert-id}
+                    (merge alert {resolved: true, resolution-notes: notes})
+                )
+                (ok true)
+            )
+            ERR-NO-ALERT
+        )
+    )
 )
