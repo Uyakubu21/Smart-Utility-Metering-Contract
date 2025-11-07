@@ -30,6 +30,10 @@
 (define-constant CRITICAL-MULTIPLIER u300)
 (define-constant MODERATE-MULTIPLIER u200)
 
+
+(define-constant ERR-BUDGET-EXCEEDED (err u114))
+(define-constant ERR-INVALID-BUDGET (err u115))
+
 (define-data-var contract-owner principal tx-sender)
 (define-data-var water-rate uint u50)
 (define-data-var electricity-rate uint u75)
@@ -546,6 +550,120 @@
                 (ok true)
             )
             ERR-NO-ALERT
+        )
+    )
+)
+
+(define-map user-budgets principal {
+    water-budget-cap: uint,
+    electricity-budget-cap: uint,
+    budget-active: bool,
+    budget-set-block: uint,
+    cycle-duration-blocks: uint
+})
+
+(define-map budget-status principal {
+    current-water-spending: uint,
+    current-electricity-spending: uint,
+    cycle-start-block: uint,
+    water-threshold-reached: bool,
+    electricity-threshold-reached: bool,
+    total-cycles-completed: uint
+})
+
+(define-read-only (get-user-budget (user principal))
+    (map-get? user-budgets user)
+)
+
+(define-read-only (get-budget-status (user principal))
+    (map-get? budget-status user)
+)
+
+(define-read-only (calculate-budget-utilization (spent uint) (cap uint))
+    (if (is-eq cap u0)
+        u0
+        (/ (* spent u100) cap)
+    )
+)
+
+(define-read-only (is-within-budget (user principal) (water-cost uint) (electricity-cost uint))
+    (match (map-get? user-budgets user)
+        budget (match (map-get? budget-status user)
+            status (and
+                (<= (+ (get current-water-spending status) water-cost) (get water-budget-cap budget))
+                (<= (+ (get current-electricity-spending status) electricity-cost) (get electricity-budget-cap budget))
+            )
+            true
+        )
+        true
+    )
+)
+
+(define-public (set-budget-cap (water-cap uint) (electricity-cap uint) (cycle-blocks uint))
+    (begin
+        (asserts! (and (> water-cap u0) (> electricity-cap u0)) ERR-INVALID-BUDGET)
+        (map-set user-budgets tx-sender {
+            water-budget-cap: water-cap,
+            electricity-budget-cap: electricity-cap,
+            budget-active: true,
+            budget-set-block: stacks-block-height,
+            cycle-duration-blocks: cycle-blocks
+        })
+        (map-set budget-status tx-sender {
+            current-water-spending: u0,
+            current-electricity-spending: u0,
+            cycle-start-block: stacks-block-height,
+            water-threshold-reached: false,
+            electricity-threshold-reached: false,
+            total-cycles-completed: u0
+        })
+        (ok true)
+    )
+)
+
+(define-public (update-budget-spending (user principal) (water-cost uint) (electricity-cost uint))
+    (begin
+        (asserts! (is-oracle tx-sender) ERR-UNAUTHORIZED)
+        (match (map-get? budget-status user)
+            status (let (
+                (new-water-spending (+ (get current-water-spending status) water-cost))
+                (new-electricity-spending (+ (get current-electricity-spending status) electricity-cost))
+            )
+            (match (map-get? user-budgets user)
+                budget (begin
+                    (map-set budget-status user {
+                        current-water-spending: new-water-spending,
+                        current-electricity-spending: new-electricity-spending,
+                        cycle-start-block: (get cycle-start-block status),
+                        water-threshold-reached: (>= new-water-spending (get water-budget-cap budget)),
+                        electricity-threshold-reached: (>= new-electricity-spending (get electricity-budget-cap budget)),
+                        total-cycles-completed: (get total-cycles-completed status)
+                    })
+                    (ok true)
+                )
+                (ok false)
+            ))
+            (ok false)
+        )
+    )
+)
+
+(define-public (reset-budget-cycle (user principal))
+    (begin
+        (asserts! (is-oracle tx-sender) ERR-UNAUTHORIZED)
+        (match (map-get? budget-status user)
+            status (begin
+                (map-set budget-status user {
+                    current-water-spending: u0,
+                    current-electricity-spending: u0,
+                    cycle-start-block: stacks-block-height,
+                    water-threshold-reached: false,
+                    electricity-threshold-reached: false,
+                    total-cycles-completed: (+ (get total-cycles-completed status) u1)
+                })
+                (ok true)
+            )
+            ERR-NOT-FOUND
         )
     )
 )
